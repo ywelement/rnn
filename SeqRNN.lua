@@ -70,9 +70,6 @@ function layer:__init(input_dim, hidden_dim)
   -- set this to true to forward inputs as batchsize x seqlen x ...
   -- instead of the internal order seqlen x batchsize
   self.batchfirst = false
-  -- set this to true for variable length sequences that seperate
-  -- independent sequences with a step of zeros (a tensor of size D)
-  self.maskzero = false
 end
 
 
