@@ -66,6 +66,13 @@ function layer:__init(input_dim, hidden_dim)
   self.grad_h0 = torch.Tensor()
   self.grad_x = torch.Tensor()
   self.gradInput = {self.grad_h0, self.grad_x}
+   
+  -- set this to true to forward inputs as batchsize x seqlen x ...
+  -- instead of the internal order seqlen x batchsize
+  self.batchfirst = false
+  -- set this to true for variable length sequences that seperate
+  -- independent sequences with a step of zeros (a tensor of size D)
+  self.maskzero = false
 end
 
 
@@ -105,43 +112,58 @@ local function check_dims(x, dims)
 end
 
 
+-- return size: N, T, D, H
+-- batchfirst = true will transpose the N x T to conform to T x N
 function layer:_get_sizes(input, gradOutput)
   local h0, x = self:_unpack_input(input)
-  local N, T = x:size(1), x:size(2)
+  
+  if batchfirst then
+    x = x:transpose(1,2)
+    gradOutput = gradOutput and gradOutput:transpose(1,2) or nil
+  end
+  
+  local T, N = x:size(1), x:size(2)
   local H, D = self.hidden_dim, self.input_dim
-  check_dims(x, {N, T, D})
+  
+  check_dims(x, {T, N, D})
   if h0 then
     check_dims(h0, {N, H})
   end
   if gradOutput then
-    check_dims(gradOutput, {N, T, H})
+    check_dims(gradOutput, {T, N, H})
   end
   return N, T, D, H
 end
 
 
 --[[
-
 Input: Table of
 - h0: Initial hidden state of shape (N, H)
 - x:  Sequence of inputs, of shape (N, T, D)
 
 Output:
 - h: Sequence of hidden states, of shape (N, T, H)
+
+Note:
+batchfirst = true will transpose the T x N output to conform to N x T
+while keeping the internal _output as T x N
 --]]
 function layer:updateOutput(input)
   self.recompute_backward = true
   local h0, x = self:_unpack_input(input)
   local N, T, D, H = self:_get_sizes(input)
+  
+  self._output = self._output or self.weight.new()
+  
   self._return_grad_h0 = (h0 ~= nil)
   if not h0 then
     h0 = self.h0
     if h0:nElement() == 0 or not self.remember_states then
       h0:resize(N, H):zero()
     elseif self.remember_states then
-      local prev_N, prev_T = self.output:size(1), self.output:size(2)
+      local prev_T, prev_N = self._output:size(1), self._output:size(2)
       assert(prev_N == N, 'batch sizes must be constant to remember states')
-      h0:copy(self.output[{{}, prev_T}])
+      h0:copy(self._output[{{}, prev_T}])
     end
   end
 
@@ -149,15 +171,20 @@ function layer:updateOutput(input)
   local Wx = self.weight[{{1, D}}]
   local Wh = self.weight[{{D + 1, D + H}}]
   
-  self.output:resize(N, T, H):zero()
   local prev_h = h0
   for t = 1, T do
-    local cur_x = x[{{}, t}]
-    local next_h = self.output[{{}, t}]
+    local cur_x = x[t]
+    local next_h = self._output[t]
     next_h:addmm(bias_expand, cur_x, Wx)
     next_h:addmm(prev_h, Wh)
     next_h:tanh()
     prev_h = next_h
+  end
+  
+  if batchfirst then
+    self.output = self._output:transpose(1,2) -- T x N -> N x T
+  else
+    self.output = self._output
   end
 
   return self.output
@@ -188,17 +215,17 @@ function layer:backward(input, gradOutput, scale)
   local grad_x = self.grad_x:resizeAs(x):zero()
   local grad_next_h = self.buffer1:resizeAs(h0):zero()
   for t = T, 1, -1 do
-    local next_h, prev_h = self.output[{{}, t}], nil
+    local next_h, prev_h = self._output[t], nil
     if t == 1 then
       prev_h = h0
     else
-      prev_h = self.output[{{}, t - 1}]
+      prev_h = self._output[t - 1]
     end
-    grad_next_h:add(grad_h[{{}, t}])
+    grad_next_h:add(grad_h[t])
     local grad_a = grad_h0:resizeAs(h0)
     grad_a:fill(1):addcmul(-1.0, next_h, next_h):cmul(grad_next_h)
-    grad_x[{{}, t}]:mm(grad_a, Wx:t())
-    grad_Wx:addmm(scale, x[{{}, t}]:t(), grad_a)
+    grad_x[t]:mm(grad_a, Wx:t())
+    grad_Wx:addmm(scale, x[t]:t(), grad_a)
     grad_Wh:addmm(scale, prev_h:t(), grad_a)
     grad_next_h:mm(grad_a, Wh:t())
     self.buffer2:resize(1, H):sum(grad_a, 1)
