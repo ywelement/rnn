@@ -1,10 +1,11 @@
-
-local rnntest = {}
+local _ = require 'moses'
+local rnntest = torch.TestSuite()
 local precision = 1e-5
 local mytester
 local benchmark = false
 
 local makeOldRecurrent_isdone = false
+
 local function makeOldRecurrent()
    
    if makeOldRecurrent_isdone then
@@ -1827,6 +1828,544 @@ function rnntest.Sequencer()
    end
 end
 
+function rnntest.Sequencer_tensor()
+   -- test Sequencer where input/gradOutput are tensors instead of tables
+   local batchSize = 4
+   local inputSize = 3
+   local outputSize = 7
+   local nStep = 5 
+   
+   -- test with recurrent module
+   local inputModule = nn.Linear(inputSize, outputSize)
+   local transferModule = nn.Sigmoid()
+   -- test MLP feedback Module (because of Module:representations())
+   local feedbackModule = nn.Euclidean(outputSize, outputSize)
+   -- rho = nStep
+   local rnn = nn.Recurrent(outputSize, inputModule, feedbackModule, transferModule, nStep)
+   rnn:zeroGradParameters()
+   local rnn2 = rnn:clone()
+   
+   local outputs = torch.Tensor(nStep, batchSize, outputSize)
+   local inputs = torch.randn(nStep, batchSize, inputSize)
+   local gradOutputs = torch.randn(nStep, batchSize, outputSize)
+   for step=1,nStep do
+      outputs[step] = rnn:forward(inputs[step]):clone()
+   end
+   
+   local gradInputs = torch.Tensor(nStep, batchSize, inputSize)
+   for step=nStep,1,-1 do
+      gradInputs[step] = rnn:backward(inputs[step], gradOutputs[step])
+   end
+   
+   local gradOutput1 = gradOutputs[1]:clone()
+   local rnn3 = nn.Sequencer(rnn2)
+   local outputs3 = rnn3:forward(inputs)
+   mytester:assert(outputs3:size(1) == outputs:size(1), "Sequencer output size err")
+   for step=1,nStep do
+      mytester:assertTensorEq(outputs3[step], outputs[step], 0.00001, "Sequencer output "..step)
+   end
+   local gradInputs3 = rnn3:backward(inputs, gradOutputs)
+  
+   mytester:assert(gradInputs3:size(1) == gradInputs:size(1), "Sequencer gradInputs size err")
+   mytester:assert(gradInputs3[1]:nElement() ~= 0) 
+   
+   for step=1,nStep do
+      mytester:assertTensorEq(gradInputs3[step], gradInputs[step], 0.00001, "Sequencer gradInputs "..step)
+   end
+   mytester:assertTensorEq(gradOutputs[1], gradOutput1, 0.00001, "Sequencer rnn gradOutput modified error")
+   
+   local nStep7 = torch.Tensor{5,4,5,3,7,3,3,3}
+   local function testRemember(rnn)
+      rnn:zeroGradParameters()
+      -- test remember for training mode (with variable length)
+      local rnn7 = rnn:clone()
+      rnn7:zeroGradParameters()
+      local rnn8 = rnn7:clone()
+      local rnn9 = rnn7:clone()
+      local rnn10 = nn.Recursor(rnn7:clone())
+      
+      local inputs7 = torch.randn(nStep7:sum(), batchSize, outputSize)
+      local outputs9 = torch.Tensor(nStep7:sum(), batchSize, outputSize)
+      for step=1,nStep7:sum() do
+         outputs9[step] = rnn9:forward(inputs7[step]):clone()
+      end
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn7:forward(inputs7[step]), 0.000001, "Sequencer "..torch.type(rnn7).." remember forward err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn7:forget()
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn7:forward(inputs7[step]), 0.000001, "Sequencer "..torch.type(rnn7).." remember forward2 err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn7:forget()
+      
+      local step = 1
+      local gradOutputs7 = torch.randn(nStep7:sum(), batchSize, outputSize)
+      local outputs7 = torch.Tensor(nStep7:sum(), batchSize, outputSize)
+      local gradInputs7 = torch.Tensor(nStep7:sum(), batchSize, outputSize)
+      for i=1,nStep7:size(1) do
+         -- forward
+         for j=1,nStep7[i] do
+            outputs7[step] = rnn7:forward(inputs7[step])
+            step = step + 1
+         end
+         -- backward
+         rnn7:maxBPTTstep(nStep7[i])
+         for _step=step-1,step-nStep7[i],-1 do
+            gradInputs7[_step] = rnn7:backward(inputs7[_step], gradOutputs7[_step])
+         end
+         -- update
+         rnn7:updateParameters(1)
+         rnn7:zeroGradParameters()
+      end
+      
+      -- nn.Recursor 
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn10:forward(inputs7[step]), 0.000001, "Recursor "..torch.type(rnn10).." remember forward err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn10:forget()
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn10:forward(inputs7[step]), 0.000001, "Recursor "..torch.type(rnn10).." remember forward2 err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn10:forget()
+      
+      local step = 1
+      local outputs10, gradOutputs10, gradInputs10 = {}, {}, {}
+      for i=1,nStep7:size(1) do
+         local start = step
+         local nStep = 0
+         for j=1,nStep7[i] do
+            outputs10[step] = rnn10:forward(inputs7[step]):clone()
+            step = step + 1
+            nStep = nStep + 1
+         end
+         rnn10:maxBPTTstep(nStep7[i])
+         local nStep2 = 0
+         for s=step-1,start,-1 do
+            gradInputs10[s] = rnn10:backward(inputs7[s], gradOutputs7[s]):clone()
+            nStep2 = nStep2 + 1
+         end
+         assert(nStep == nStep2)
+         rnn10:updateParameters(1)
+         rnn10:zeroGradParameters()
+      end
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(gradInputs10[step], gradInputs7[step], 0.0000001, "Recursor "..torch.type(rnn7).." remember variable backward err "..i.." "..j)
+            mytester:assertTensorEq(outputs10[step], outputs7[step], 0.0000001, "Recursor "..torch.type(rnn7).." remember variable forward err "..i.." "..j)
+            step = step + 1
+         end
+      end
+      
+      -- nn.Sequencer
+      
+      local seq = nn.Sequencer(rnn8)
+      seq:remember('both')
+      local outputs8, gradInputs8 = {}, {}
+      local step = 1
+      for i=1,nStep7:size(1) do
+         local inputs8 = inputs7:sub(step,step+nStep7[i]-1)
+         local gradOutputs8 = gradOutputs7:sub(step,step+nStep7[i]-1)
+         outputs8[i] = seq:forward(inputs8):clone()
+         gradInputs8[i] = seq:backward(inputs8, gradOutputs8):clone()
+         seq:updateParameters(1)
+         seq:zeroGradParameters()
+         step = step + nStep7[i]
+      end
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(gradInputs8[i][j], gradInputs7[step], 0.0000001, "Sequencer "..torch.type(rnn7).." remember variable backward err "..i.." "..j)
+            mytester:assertTensorEq(outputs8[i][j], outputs7[step], 0.0000001, "Sequencer "..torch.type(rnn7).." remember variable forward err "..i.." "..j)
+            step = step + 1
+         end
+      end
+      
+      local params7 = rnn7:parameters()
+      local params8 = rnn8:parameters()
+      for i=1,#params7 do
+         mytester:assertTensorEq(params7[i], params8[i], 0.0000001, "Sequencer "..torch.type(rnn7).." remember params err "..i)
+      end
+      
+      -- test in evaluation mode with remember and variable rho
+      local rnn7 = rnn:clone() -- a fresh copy (no hidden states)
+      local params7 = rnn7:parameters()
+      local params9 = rnn9:parameters() -- not a fresh copy
+      for i,param in ipairs(rnn8:parameters()) do
+         params7[i]:copy(param)
+         params9[i]:copy(param)
+      end
+      
+      rnn7:evaluate()
+      rnn9:evaluate()
+      rnn9:forget()
+      
+      local inputs7 = torch.randn(nStep7:sum(), batchSize, outputSize)
+      local outputs9 = torch.Tensor(nStep7:sum(), batchSize, outputSize)
+      for step=1,nStep7:sum() do
+         outputs9[step] = rnn9:forward(inputs7[step])
+      end
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn7:forward(inputs7[step]), 0.000001, "Sequencer "..torch.type(rnn7).." remember eval forward err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn7:forget()
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn7:forward(inputs7[step]), 0.000001, "Sequencer "..torch.type(rnn7).." remember eval forward2 err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn7:forget()
+      
+      local step = 1
+      local outputs7 = {}
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            outputs7[step] = rnn7:forward(inputs7[step]):clone()
+            step = step + 1
+         end
+      end
+      
+      seq:remember('both')
+      local outputs8 = {}
+      local step = 1
+      for i=1,nStep7:size(1) do
+         seq:evaluate()
+         local inputs8 = inputs7:sub(step,step+nStep7[i]-1)
+         local gradOutputs8 = gradOutputs7:sub(step,step+nStep7[i]-1)
+         outputs8[i] = seq:forward(inputs8):clone()
+         step = step + nStep7[i]
+      end
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs8[i][j], outputs7[step], 0.0000001, "Sequencer "..torch.type(rnn7).." remember variable eval forward err "..i.." "..j)
+            step = step + 1
+         end
+      end
+      
+      -- test remember for training mode (with variable length) (from evaluation to training)
+      
+      rnn7:forget()
+      rnn9:forget()
+      
+      rnn7:training()
+      rnn9:training()
+      
+      rnn7:zeroGradParameters()
+      seq:zeroGradParameters()
+      rnn9:zeroGradParameters()
+      
+      local inputs7 = torch.randn(nStep7:sum(), batchSize, outputSize)
+      local outputs9 = torch.Tensor(nStep7:sum(), batchSize, outputSize)
+      for step=1,nStep7:sum() do
+         inputs7[step] = torch.randn(batchSize, outputSize)
+         outputs9[step] = rnn9:forward(inputs7[step]):clone()
+      end
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn7:forward(inputs7[step]), 0.000001, "Sequencer "..torch.type(rnn7).." remember forward err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn7:forget()
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(outputs9[step], rnn7:forward(inputs7[step]), 0.000001, "Sequencer "..torch.type(rnn7).." remember forward2 err "..step)
+            step = step + 1
+         end
+      end
+      
+      rnn7:forget()
+      
+      local step = 1
+      local outputs7 = torch.Tensor(nStep7:sum(), batchSize, outputSize)
+      local gradOutputs7 = torch.randn(nStep7:sum(), batchSize, outputSize)
+      local gradInputs7 = torch.Tensor(nStep7:sum(), batchSize, outputSize)     
+      for i=1,nStep7:size(1) do
+         -- forward
+         for j=1,nStep7[i] do
+            outputs7[step] = rnn7:forward(inputs7[step])
+            step = step + 1
+         end
+         -- backward
+         rnn7:maxBPTTstep(nStep7[i])
+         for _step=step-1,step-nStep7[i],-1 do
+            gradInputs7[_step] = rnn7:backward(inputs7[_step], gradOutputs7[_step])
+         end
+         -- update
+         rnn7:updateParameters(1)
+         rnn7:zeroGradParameters()
+      end
+      
+      seq:remember('both')
+      local outputs8, gradInputs8 = {}, {}
+      local step = 1
+      for i=1,nStep7:size(1) do
+         seq:training()
+         local inputs8 = inputs7:sub(step,step+nStep7[i]-1)
+         local gradOutputs8 = gradOutputs7:sub(step,step+nStep7[i]-1)
+         outputs8[i] = seq:forward(inputs8):clone()
+         gradInputs8[i] = seq:backward(inputs8, gradOutputs8):clone()
+         seq:updateParameters(1)
+         seq:zeroGradParameters()
+         step = step + nStep7[i]
+      end
+      
+      local step = 1
+      for i=1,nStep7:size(1) do
+         for j=1,nStep7[i] do
+            mytester:assertTensorEq(gradInputs8[i][j], gradInputs7[step], 0.0000001, "Sequencer "..torch.type(rnn7).." remember variable backward err "..i.." "..j)
+            mytester:assertTensorEq(outputs8[i][j], outputs7[step], 0.0000001, "Sequencer "..torch.type(rnn7).." remember variable forward err "..i.." "..j)
+            step = step + 1
+         end
+      end
+      
+      local params7 = rnn7:parameters()
+      local params8 = rnn8:parameters()
+      for i=1,#params7 do
+         mytester:assertTensorEq(params7[i], params8[i], 0.0000001, "Sequencer "..torch.type(rnn7).." remember params err "..i)
+      end
+   end
+   
+   
+   testRemember(nn.Recurrent(outputSize, nn.Linear(outputSize, outputSize), feedbackModule:clone(), transferModule:clone(), nStep7:max()))
+   testRemember(nn.LSTM(outputSize, outputSize, nStep7:max()))
+
+   -- test in evaluation mode
+   rnn3:evaluate()
+   local outputs4 = rnn3:forward(inputs)
+   local outputs4_ = outputs4:clone()
+   mytester:assert(outputs4:size(1) == outputs:size(1), "Sequencer evaluate output size err")
+   for step=1,nStep do
+      mytester:assertTensorEq(outputs4[step], outputs[step], 0.00001, "Sequencer evaluate output "..step)
+   end
+   local inputs5 = inputs:sub(1,nStep-1) -- remove last input
+   local outputs5 = rnn3:forward(inputs5)
+   mytester:assert(outputs5:size(1) == outputs:size(1) - 1, "Sequencer evaluate -1 output size err")
+   for step=1,nStep-1 do
+      mytester:assertTensorEq(outputs[step], outputs5[step], 0.00001, "Sequencer evaluate -1 output "..step)
+   end
+   
+   -- test evaluation with remember 
+   rnn3:remember()
+   rnn3:evaluate()
+   rnn3:forget()
+   local inputsA, inputsB = inputs:sub(1,3), inputs:sub(4,5)
+   local outputsA = rnn3:forward(inputsA):clone()
+   local outputsB = rnn3:forward(inputsB)
+   mytester:assert(outputsA:size(1) == 3, "Sequencer evaluate-remember output size err A")
+   mytester:assert(outputsB:size(1) == 2, "Sequencer evaluate-remember output size err B")
+   local outputsAB = {outputsA[1], outputsA[2], outputsA[3], outputsB[1], outputsB[2]}
+   for step=1,5 do
+      mytester:assertTensorEq(outputsAB[step], outputs4_[step], 0.00001, "Sequencer evaluate-remember output "..step)
+   end
+   
+   -- test with non-recurrent module
+   local inputSize = 10
+   local inputs = torch.randn(nStep, batchSize, inputSize)
+   local linear = nn.Euclidean(inputSize, outputSize)
+   local seq, outputs, gradInputs
+   for k=1,3 do
+      outputs, gradInputs = {}, {}
+      linear:zeroGradParameters()
+      local clone = linear:clone()
+      for step=1,nStep do
+         outputs[step] = linear:forward(inputs[step]):clone()
+         gradInputs[step] = linear:backward(inputs[step], gradOutputs[step]):clone()
+      end
+      
+      seq = nn.Sequencer(clone)
+      local outputs2 = seq:forward(inputs)
+      local gradInputs2 = seq:backward(inputs, gradOutputs)
+      
+      mytester:assert(outputs2:size(1) == #outputs, "Sequencer output size err")
+      mytester:assert(gradInputs2:size(1) == #gradInputs, "Sequencer gradInputs size err")
+      for step,output in ipairs(outputs) do
+         mytester:assertTensorEq(outputs2[step], output, 0.00001, "Sequencer output "..step)
+         mytester:assertTensorEq(gradInputs2[step], gradInputs[step], 0.00001, "Sequencer gradInputs "..step)
+      end
+   end
+   
+   local inputs3 = inputs:float()
+   local gradOutputs3 = gradOutputs:float()
+   local seq3 = seq:float()
+   local outputs3 = seq:forward(inputs3)
+   local gradInputs3 = seq:backward(inputs3, gradOutputs3)
+   
+   -- test for zeroGradParameters
+   local seq = nn.Sequencer(nn.Linear(inputSize,outputSize))
+   seq:zeroGradParameters()
+   seq:forward(inputs)
+   seq:backward(inputs, gradOutputs)
+   local params, gradParams = seq:parameters()
+   for i,gradParam in ipairs(gradParams) do
+      mytester:assert(gradParam:sum() ~= 0, "Sequencer:backward err "..i)
+   end
+   local param, gradParam = seq:getParameters()
+   seq:zeroGradParameters()
+   mytester:assert(gradParam:sum() == 0, "Sequencer:getParameters err")
+   local params, gradParams = seq:parameters()
+   for i,gradParam in ipairs(gradParams) do
+      mytester:assert(gradParam:sum() == 0, "Sequencer:zeroGradParameters err "..i)
+   end
+   
+   -- test with LSTM
+   local outputSize = inputSize
+   local lstm = nn.LSTM(inputSize, outputSize, nil, false)
+   lstm:zeroGradParameters()
+   local lstm2 = lstm:clone()
+   
+   local inputs = torch.randn(nStep, batchSize, inputSize)
+   local outputs = torch.Tensor(nStep, batchSize, outputSize)
+   local gradOutputs = torch.randn(nStep, batchSize, outputSize)
+   
+   local gradOutput1 = gradOutputs[2]:clone()
+   for step=1,nStep do
+      outputs[step] = lstm:forward(inputs[step])
+   end
+   
+   local gradInputs72 = torch.Tensor(nStep, batchSize, inputSize)
+   for step=nStep,1,-1 do
+      gradInputs72[step] = lstm:backward(inputs[step], gradOutputs[step])
+   end
+   
+   local lstm3 = nn.Sequencer(lstm2)
+   lstm3:zeroGradParameters()
+   local outputs3 = lstm3:forward(inputs)
+   local gradInputs3 = lstm3:backward(inputs, gradOutputs)
+   mytester:assert(outputs3:size(1) == outputs:size(1), "Sequencer LSTM output size err")
+   mytester:assert(gradInputs3:size(1) == gradInputs72:size(1), "Sequencer LSTM gradInputs size err")
+   for step=1,nStep do
+      mytester:assertTensorEq(outputs3[step], outputs[step], 0.00001, "Sequencer LSTM output "..step)
+      mytester:assertTensorEq(gradInputs3[step], gradInputs72[step], 0.00001, "Sequencer LSTM gradInputs "..step)
+   end
+   mytester:assertTensorEq(gradOutputs[2], gradOutput1, 0.00001, "Sequencer lstm gradOutput modified error")
+   
+   -- test remember modes : 'both', 'eval' for training(), evaluate(), training()
+   local lstm = nn.LSTM(5,5)
+   local seq = nn.Sequencer(lstm)
+   local inputTrain = torch.randn(3,5)
+   local inputEval = torch.randn(1,5)
+
+   -- this shouldn't fail
+   local modes = {'both', 'eval'}
+   for i, mode in ipairs(modes) do
+     seq:remember(mode)
+
+     -- do one epoch of training
+     seq:training()
+     seq:forward(inputTrain)
+     seq:backward(inputTrain, inputTrain)
+
+     -- evaluate
+     seq:evaluate()
+     seq:forward(inputEval)
+
+     -- do another epoch of training
+     seq:training()
+     seq:forward(inputTrain)
+     seq:backward(inputTrain, inputTrain)
+   end
+end
+
+function rnntest.Sequencer_tensoreval()
+   -- test that it behave the same in evaluation
+   local seqlen, batchsize, fsize = 5, 3, 4
+   local input = torch.randn(seqlen, batchsize, fsize)
+   local lstm = nn.FastLSTM(fsize, fsize)
+   local lstm2 = lstm:clone()
+   local seq = nn.Sequencer(lstm)
+   local seq2 = nn.Sequential()
+            :add(nn.SplitTable(1))
+            :add(nn.Sequencer(lstm2))
+   seq:evaluate()
+   seq2:evaluate()
+   local output = seq:forward(input)
+   local output2 = seq2:forward(input)
+   for i=1,seqlen do
+      mytester:assertTensorEq(output[i], output2[i], 0.000001)
+   end
+   seq:forget()
+   seq2:forget()
+   -- test eval after forget
+   local input = torch.randn(seqlen, batchsize, fsize)
+   local output = seq:forward(input)
+   local output2 = seq2:forward(input)
+   for i=1,seqlen do
+      mytester:assertTensorEq(output[i], output2[i], 0.000001)
+   end
+   -- test eval after forget + variable size
+   for i=1,3 do
+      seqlen, batchsize = math.random(2,7), math.random(2,7)
+      local input = torch.randn(seqlen, batchsize, fsize)
+      local output = seq:forward(input)
+      local output2 = seq2:forward(input)
+      for i=1,seqlen do
+         mytester:assertTensorEq(output[i], output2[i], 0.000001)
+      end
+   end
+   -- test again with remember
+   seq:remember()
+   seq2:remember()
+   local input = torch.randn(seqlen, batchsize, fsize)
+   local outputs = seq:forward(input)
+   local outputs2 = seq2:forward(input)
+   for i=1,seqlen do
+      mytester:assertTensorEq(output[i], output2[i], 0.000001)
+   end
+   for i=1,3 do
+      local seqlen = math.random(2,7)
+      local input = torch.randn(seqlen, batchsize, fsize)
+      local outputs = seq:forward(input)
+      local outputs2 = seq2:forward(input)
+      for i=1,seqlen do
+         mytester:assertTensorEq(output[i], output2[i], 0.000001)
+      end
+   end
+end
+
 function rnntest.BiSequencer()
    local hiddenSize = 8
    local batchSize = 4
@@ -2088,19 +2627,32 @@ function rnntest.SequencerCriterion()
       mytester:assertTensorEq(gradInput[i]:float(), gradInput3[i], 0.000001, "SequencerCriterion backward type err "..i)
    end
    
+   -- Test tensor as input
+   local sc2 = sc:clone()
+   local split = nn.SplitTable(1)
+   local input = torch.randn(nStep, batchSize, inputSize):float()
+   local target = torch.Tensor(nStep, batchSize):float()
+   for i=1,nStep do
+     target[i] = torch.randperm(inputSize):narrow(1,1,batchSize)
+   end
+   local errTensorInput = sc:forward(input, target) -- As Tensor
+   local errTableInput = sc2:forward(split:forward(input), split:forward(target)) -- As Table
+   mytester:assert(math.abs(errTensorInput - errTableInput) == 0, "SequencerCriterion forward type err") 
+   local gradInputTensor = sc:backward(input, target)
+   local gradInputTable = sc:backward(split:forward(input), split:forward(target))
+   mytester:assertTensorEq(gradInputTensor, torch.cat(gradInputTable, 1):view(gradInputTensor:size()), 0, "SequencerCriterion backward type err ")
+   
    if pcall(function() require 'cunn' end) then
       -- test cuda()
       sc.gradInput = {}
       sc:cuda()
    
       local gradInput4 = {}
-      for i=1,nStep do
-         input[i] = input[i]:cuda()
-         target[i] = target[i]:cuda()
-      end
+      input = input:cuda()
+      target = target:cuda()
       
       local err4 = sc:forward(input, target)
-      mytester:assert(math.abs(err - err4) < 0.000001, "SequencerCriterion forward cuda err") 
+      mytester:assert(math.abs(errTensorInput - err4) < 0.000001, "SequencerCriterion forward cuda err") 
       local gradInput4 = sc:backward(input, target)
       for i=1,nStep do
          mytester:assertTensorEq(gradInput4[i]:float(), gradInput3[i], 0.000001, "SequencerCriterion backward cuda err "..i)
@@ -2146,6 +2698,20 @@ function rnntest.RepeaterCriterion()
    for i=1,nStep do
       mytester:assertTensorEq(gradInput[i]:float(), gradInput3[i], 0.000001, "RepeaterCriterion backward type err "..i)
    end
+   
+   -- Test tensor as input
+   sc:double()
+   local sc2 = sc:clone()
+   local split = nn.SplitTable(1)
+   local input = torch.randn(nStep, batchSize, inputSize)
+   local target = torch.randperm(inputSize):narrow(1,1,batchSize)
+   local errTensorInput = sc:forward(input, target) -- As Tensor
+   local errTableInput = sc2:forward(split:forward(input), target) -- As Table
+   mytester:assert(math.abs(errTensorInput - errTableInput) == 0, "RepeaterCriterion forward type err") 
+   local gradInputTensor = sc:backward(input, target)
+   local gradInputTable = sc:backward(split:forward(input), target)
+   mytester:assertTensorEq(gradInputTensor, torch.cat(gradInputTable, 1):view(gradInputTensor:size()), 0, "RepeaterCriterion backward type err ")
+   
 end
 
 function rnntest.RecurrentAttention()
@@ -4089,6 +4655,16 @@ function rnntest.MaskZeroCriterion()
    
    local gradInput = crit:backward(input, target)
    mytester:assert(gradInput:sum() == 0, "MaskZeroCriterion all zeros bwd err")
+   
+   -- test table input
+   local inputSize = 5
+   local input = {torch.randn(batchSize, inputSize), torch.randn(batchSize, inputSize)}
+   local target = torch.randn(batchSize):fill(1)
+   input[1][2]:zero()
+   local criterion = nn.MaskZeroCriterion(nn.CosineEmbeddingCriterion(), 1)
+   local loss = criterion:forward(input, target)
+   local gradInput = criterion:backward(input, target)
+   mytester:assert(gradInput[1][2]:sum() + gradInput[2][2]:sum() == 0)
 end
 
 function rnntest.MaskZero_where()
@@ -4305,7 +4881,7 @@ function rnntest.encoderdecoder()
      decLSTM.userPrevOutput = nn.rnn.recursiveCopy(decLSTM.userPrevOutput, encLSTM.outputs[opt.inputSeqLen])
      decLSTM.userPrevCell = nn.rnn.recursiveCopy(decLSTM.userPrevCell, encLSTM.cells[opt.inputSeqLen])
    end
-
+   
    --[[ Backward coupling: Copy decoder gradients to encoder LSTM ]]--
    local function backwardConnect(encLSTM, decLSTM)
      encLSTM.userNextGradCell = nn.rnn.recursiveCopy(encLSTM.userNextGradCell, decLSTM.userGradPrevCell)
@@ -4633,7 +5209,7 @@ function rnntest.issue204()
    mytester:assertTensorEq(gradInputs[2], gradInputs2[1], 0.000001)
 end
 
-function rnntest.SeqLSTM()
+function rnntest.SeqLSTM_main()
    local inputsize = 2 
    local outputsize = 3
    
@@ -4822,7 +5398,7 @@ function rnntest.SeqLSTM()
    local p1 = seqlstm:toFastLSTM():getParameters()
    local p2 = lstm2:getParameters()
    mytester:assertTensorEq(p1, p2, 0.0000001)
-   testmodule(seqlstm, false, seqlen, batchsize, lstm2, 'both', eval, seqlstm2)
+   testmodule(seqlstm, false, seqlen, batchsize, lstm2, 'both', eval, seqlstm2) --
    mytester:assert(seqlstm.train == false)
    mytester:assert(lstm2.train == false)
    mytester:assert(seqlstm._remember == 'both')
@@ -4844,13 +5420,12 @@ end
 
 function rnntest.SeqLSTM_maskzero()
    -- tests that it works with non-masked inputs regardless of maskzero's value.
-   -- the actual maskzero = true tests with masked inputs are in SeqLSTM unit test.
+   -- Note that more maskzero = true tests with masked inputs are in SeqLSTM unit test.
    local T, N, D, H = 3, 2, 4, 5
    local seqlstm = nn.SeqLSTM(D,H)
    seqlstm.maskzero = false
    local seqlstm2 = seqlstm:clone()
    seqlstm2.maskzero = true
-   
    
    local input = torch.randn(T, N, D)
    local gradOutput = torch.randn(T, N, H)
@@ -4871,6 +5446,180 @@ function rnntest.SeqLSTM_maskzero()
    local params2, gradParams2 = seqlstm2:getParameters()
    
    mytester:assertTensorEq(gradParams, gradParams2, 0.000001)
+   if benchmark then
+      local T, N, D, H = 20, 20, 50, 50
+      if pcall(function() require 'cunn' end) then
+         T, N, D, H = 100, 128, 250, 250
+      end
+      
+      local seqlstm = nn.SeqLSTM(D,H)
+      local input = torch.randn(T, N, D)
+      local gradOutput = torch.randn(T, N, H)
+      
+      if cunn then
+         input = input:cuda()
+         gradOutput = gradOutput:cuda()
+         seqlstm:cuda()
+      end
+      
+      seqlstm.maskzero = false
+      seqlstm:forward(input)
+      seqlstm:backward(input, gradOutput)
+      
+      if cunn then cutorch.synchronize() end
+      local a = torch.Timer()
+      for i=1,5 do
+         seqlstm:forward(input)
+         seqlstm:backward(input, gradOutput)
+      end
+      if cunn then cutorch.synchronize() end
+      local nonmasktime = a:time().real
+      
+      for t=1,T do
+         for n=1,N do
+            if math.random() <= 1/20 then
+               input[{t,n,{}}] = 0
+            end
+         end
+      end
+      
+      seqlstm.maskzero = true
+      seqlstm:forward(input)
+      seqlstm:backward(input, gradOutput)
+      
+      if cunn then cutorch.synchronize() end
+      local a = torch.Timer()
+      for i=1,5 do
+         seqlstm:forward(input)
+         seqlstm:backward(input, gradOutput)
+      end
+      if cunn then cutorch.synchronize() end
+      local masktime = a:time().real
+      print("mask vs nonmask SeqLSTM", masktime, nonmasktime)
+   end
+end
+
+function rnntest.SeqLSTMP_main()
+   -- test that LSTM = LSTMP when projection layer is identity
+   local inputsize = 2 
+   local hiddensize = 3
+   local outputsize = 3
+   local seqlen = 6
+   local batchsize = 5
+   
+   local lstm = nn.SeqLSTM(inputsize, outputsize)
+   local lstmp = nn.SeqLSTMP(inputsize, hiddensize, outputsize)
+   
+   local params, gradParams = lstm:parameters()
+   local paramsp, gradParamsp = lstmp:parameters()
+   
+   mytester:assert(#params + 1 == #paramsp)
+   
+   for i=1,#params do
+      paramsp[i]:copy(params[i])
+   end 
+   
+   local wO = paramsp[3]
+   mytester:assertTableEq(wO:size():totable(), {3,3})
+   wO:eye(3,3)
+   
+   local input = torch.randn(seqlen, batchsize, inputsize)
+   local gradOutput = torch.randn(seqlen, batchsize, outputsize)
+   
+   local output = lstm:forward(input)
+   local outputp = lstmp:forward(input)
+   
+   mytester:assertTensorEq(output, outputp, 0.000001)
+   
+   lstm:zeroGradParameters()
+   lstmp:zeroGradParameters()
+   
+   mytester:assert(math.abs(gradParamsp[3]:sum()) < 0.00001)
+   
+   local gradInput = lstm:backward(input, gradOutput)
+   local gradInputp = lstmp:backward(input, gradOutput)
+   
+   mytester:assertTensorEq(gradInput, gradInputp, 0.000001)
+   
+   for i=1,#params do
+      mytester:assertTensorEq(gradParams[i], gradParamsp[i], 0.000001)
+   end
+   
+   mytester:assert(math.abs(gradParamsp[3]:sum()) > 0.00001)
+   
+   -- test with maskzero
+   
+   for i=1,seqlen do
+      for j=1,batchsize do
+         if math.random() < 0.2 then
+            input[{i,j,{}}]:zero()
+         end
+      end
+   end
+   
+   lstmp.maskzero = true
+   lstm.maskzero = true
+   
+   local output = lstm:forward(input)
+   local outputp = lstmp:forward(input)
+   
+   mytester:assertTensorEq(output, outputp, 0.000001)
+   
+   lstm:zeroGradParameters()
+   lstmp:zeroGradParameters()
+   
+   local gradInput = lstm:backward(input, gradOutput)
+   local gradInputp = lstmp:backward(input, gradOutput)
+   
+   mytester:assertTensorEq(gradInput, gradInputp, 0.000001)
+   
+   for i=1,#params do
+      mytester:assertTensorEq(gradParams[i], gradParamsp[i], 0.000001)
+   end
+   
+   mytester:assert(math.abs(gradParamsp[3]:sum()) > 0.00001)
+   
+   -- test with hiddensize ~= outputsize and maskzero
+   lstm = nil
+   
+   local hiddensize = 4
+   
+   local lstmp = nn.SeqLSTMP(inputsize, hiddensize, outputsize)
+   local lstmp2 = nn.SeqLSTMP(inputsize, hiddensize, outputsize)
+   
+   local params, gradParams = lstmp:parameters()
+   local params2, gradParams2 = lstmp2:parameters()
+   
+   for i=1,#params do
+      params[i]:copy(params2[i])
+   end
+   
+   lstmp:zeroGradParameters()
+   lstmp2:zeroGradParameters()
+   
+   local input = torch.randn(seqlen, batchsize, inputsize)
+   input[3] = 0 -- zero the 3 time-step
+   
+   lstmp.maskzero = true
+   local output = lstmp:forward(input)
+   local gradInput = lstmp:backward(input, gradOutput)
+   
+   lstmp2:remember('neither')
+   local input1, input2 = input:sub(1,2), input:sub(4,seqlen)
+   local gradOutput1, gradOutput2 = gradOutput:sub(1,2), gradOutput:sub(4,seqlen)
+   local output2 = torch.zeros(output:size())
+   local gradInput2 = torch.zeros(gradInput:size())
+   output2:sub(1,2):copy(lstmp2:forward(input1))
+   gradInput2:sub(1,2):copy(lstmp2:backward(input1, gradOutput1))
+   output2:sub(4,seqlen):copy(lstmp2:forward(input2))
+   gradInput2:sub(4,seqlen):copy(lstmp2:backward(input2, gradOutput2))
+   
+   mytester:assertTensorEq(output, output2, 0.000001)
+   mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+   
+   for i=1,#params do
+      mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.000001, 'error in gradParams '..i)
+   end
 end
 
 function rnntest.FastLSTM_issue203()
@@ -5057,13 +5806,19 @@ function rnntest.clearState()
       local t = {torch.Tensor(4), torch.Tensor(4), torch.Tensor(4)}
       local output = seq:forward(input)
    end
+   
+   local nsharedclone = #seqLSTM.sharedClones
    seq:clearState()
 
    -- Test if shared clones are deleted
-   mytester:assert(#seqLSTM.sharedClones == 0, 'sharedClones should be empty after clear')
+   mytester:assert(#seqLSTM.sharedClones == nsharedclone, 'sharedClones should remain after clear')
    mytester:assert(#seqLSTM.cells == 0, 'cells should be empty after clear')
    mytester:assert(#seqLSTM.gradCells == 0, 'gradCells should be empty after clear')
-   mytester:assert(seqLSTM.nSharedClone == 0, 'nSharedClone should reflect count')
+   mytester:assert(seqLSTM.nSharedClone == nsharedclone, 'nSharedClone should reflect count')
+   
+   for i=1,nsharedclone do
+      mytester:assert(#seqLSTM.sharedClones[i].output == 0, 'shared clones should be cleared of state')
+   end
 
    -- Make sure it still works after clearing
    for i=1,10 do
@@ -5256,6 +6011,669 @@ function rnntest.NormStabilizer()
    end
    
    ns:updateLoss()
+end
+
+function rnntest.NCE_MaskZero()
+   local opt = {
+      datasize = 20,
+      batchsize = 4,
+      seqlen = 5,
+      uniform = 0.1,
+      hiddensize = {100},
+      vocabsize = 100,
+      dropout = 0,
+      k = 25
+   }
+   
+   local lm = nn.Sequential()
+
+   -- input layer (i.e. word embedding space)
+   local lookup = nn.LookupTableMaskZero(opt.vocabsize, opt.hiddensize[1])
+   lookup.maxnormout = -1 -- prevent weird maxnormout behaviour
+   lm:add(lookup) -- input is seqlen x batchsize
+   if opt.dropout > 0 then
+      lm:add(nn.Dropout(opt.dropout))
+   end
+
+   -- rnn layers
+   local inputsize = opt.hiddensize[1]
+   for i,hiddensize in ipairs(opt.hiddensize) do
+      -- this is a faster version of nnSequencer(nn.FastLSTM(inpusize, hiddensize))
+      local rnn = nn.SeqLSTM(inputsize, hiddensize)
+      rnn.maskzero = true
+      lm:add(rnn)
+      if opt.dropout > 0 then
+         lm:add(nn.Dropout(opt.dropout))
+      end
+      inputsize = hiddensize
+   end
+
+   lm:add(nn.SplitTable(1))
+   
+   -- output layer
+   local unigram = torch.FloatTensor():range(1,opt.vocabsize)
+   unigram:pow(2)
+   local ncemodule = nn.NCEModule(inputsize, opt.vocabsize, opt.k, unigram)
+
+   -- NCE requires {input, target} as inputs
+   lm = nn.Sequential()
+      :add(nn.ParallelTable()
+         :add(lm):add(nn.Identity()))
+      :add(nn.ZipTable()) -- {{x1,x2,...}, {t1,t2,...}} -> {{x1,t1},{x2,t2},...}
+
+   -- encapsulate stepmodule into a Sequencer
+   lm:add(nn.Sequencer(nn.MaskZero(ncemodule, 1)))
+
+   -- remember previous state between batches
+   lm:remember()
+
+   if opt.uniform > 0 then
+      for k,param in ipairs(lm:parameters()) do
+         param:uniform(-opt.uniform, opt.uniform)
+      end
+   end
+
+   --[[ loss function ]]--
+
+   local crit = nn.MaskZeroCriterion(nn.NCECriterion(), 0)
+    
+   local targetmodule =  nn.SplitTable(1)
+   local criterion = nn.SequencerCriterion(crit)
+   
+   local data = {
+      inputs = torch.LongTensor(opt.datasize, opt.seqlen, opt.batchsize):random(0,opt.vocabsize),
+      targets = torch.LongTensor(opt.datasize, opt.seqlen, opt.batchsize):random(1,opt.vocabsize)
+   }
+   
+   local starterr
+   local err
+   local found = false
+   for epoch=1,5 do
+      err = 0
+      for i=1,opt.datasize do
+         local input, target = data.inputs[i], data.targets[i]
+         local target = targetmodule:forward(target)
+         local output = lm:forward({input, target})
+         err = err + criterion:forward(output, target)
+         local gradOutput = criterion:backward(output, target)
+         if not found then
+            for i=1,input:size(1) do
+               for j=1,input:size(2) do
+                  if input[{i,j}] == 0 then
+                     found = true
+                     -- test that it works with mask zero
+                     mytester:assert(output[i][1][j] == 0)
+                     mytester:assert(gradOutput[i][1][j] == 0)
+                  end
+               end
+            end
+         end
+         lm:zeroGradParameters()
+         local gradInput = lm:backward({input, target}, gradOutput)
+         lm:updateParameters(0.05)
+      end
+      if epoch == 1 then
+         starterr = err
+      end
+   end
+   mytester:assert(found)
+   mytester:assert(err < starterr, string.format("err=%f should be smaller than starterr=%f", err, starterr))
+end
+
+local function check_size(x, dims)
+  mytester:assert(x:dim() == #dims)
+  for i, d in ipairs(dims) do
+    mytester:assert(x:size(i) == d)
+  end
+end
+
+
+function rnntest.SeqGRU_testForward()
+  local N, T, D, H = 3, 4, 5, 6
+
+  local h0 = torch.randn(N, H)
+  local x  = torch.randn(T, N, D)
+
+  local gru = nn.SeqGRU(D, H)
+  local h = gru:forward{h0, x}
+
+  -- Do a naive forward pass
+  local naive_h = torch.Tensor(T, N, H)
+  
+
+  -- Unpack weight, bias for each gate
+  local Wxr = gru.weight[{{1, D}, {1, H}}]
+  local Wxu = gru.weight[{{1, D}, {H + 1, 2 * H}}]
+  local Wxhc = gru.weight[{{1, D}, {2 * H + 1, 3 * H}}]
+  
+  
+  local Whr = gru.weight[{{D + 1, D + H}, {1, H}}]
+  local Whu = gru.weight[{{D + 1, D + H}, {H + 1, 2 * H}}]
+  local Whhc = gru.weight[{{D + 1, D + H}, {2 * H + 1, 3 * H}}]
+  
+  
+  local br = gru.bias[{{1, H}}]:view(1, H):expand(N, H)
+  local bu = gru.bias[{{H + 1, 2 * H}}]:view(1, H):expand(N, H)
+  local bhc = gru.bias[{{2 * H + 1, 3 * H}}]:view(1, H):expand(N, H)
+  
+
+  local prev_h = h0:clone()
+  for t = 1, T do
+    local xt = x[t]
+    local u = torch.sigmoid(torch.mm(xt, Wxu) + torch.mm(prev_h, Whu) + bu)
+    local r = torch.sigmoid(torch.mm(xt, Wxr) + torch.mm(prev_h, Whr) + br)
+    local hc = torch.tanh(torch.mm(xt, Wxhc) + torch.mm(torch.cmul(prev_h,r), Whhc) + bhc)
+    local next_h = hc - torch.cmul(hc, u) + torch.cmul(prev_h, u)
+    
+    naive_h[t] = next_h
+    
+    prev_h = next_h
+  end
+  
+  mytester:assertTensorEq(naive_h, h, 1e-10)
+end
+
+
+-- Make sure that everything works when we don't pass initial hidden or initial
+-- cell state; in this case we only pass input sequence of vectors
+function rnntest.noHiddenTest()
+  local N, T, D, H = 4, 5, 6, 7
+  local gru = nn.SeqGRU(D, H)
+
+  for t = 1, 3 do
+    local x = torch.randn(T, N, D)
+    local dout = torch.randn(T, N, H)
+
+    local out = gru:forward(x)
+    local din = gru:backward(x, dout)
+
+    mytester:assert(torch.isTensor(din))
+    check_size(din, {T, N, D})
+
+    -- Make sure the initial hidden state are zero
+    mytester:assertTensorEq(gru.h0, torch.zeros(N, H), 0)
+  end
+end
+
+
+function rnntest.SeqGRU_rememberStatesTest()
+  local N, T, D, H = 5, 6, 7, 8
+  local gru = nn.SeqGRU(D, H)
+  gru:remember('both')
+
+  local final_h = nil
+  for t = 1, 4 do
+    local x = torch.randn(T, N, D)
+    local dout = torch.randn(T, N, H)
+    local out = gru:forward(x)
+    local din = gru:backward(x, dout)
+
+    if t == 1 then
+      mytester:assertTensorEq(gru.h0, torch.zeros(N, H), 0)
+    elseif t > 1 then
+      mytester:assertTensorEq(gru.h0, final_h, 0)
+    end
+    final_h = out[T]:clone()
+  end
+
+  -- Initial states should reset to zero after we call resetStates
+  gru:resetStates()
+  local x = torch.randn(T, N, D)
+  local dout = torch.randn(T, N, H)
+  gru:forward(x)
+  gru:backward(x, dout)
+  mytester:assertTensorEq(gru.h0, torch.zeros(N, H), 0)
+end
+
+function rnntest.SeqGRU_main()
+   local inputsize = 2 
+   local outputsize = 3
+   
+   
+   -- compare SeqGRU to GRU (forward, backward, update)
+   local function testmodule(seqGRU, batchfirst, seqlen, batchsize, gru2, remember, eval, seqGRU2, maskzero)
+      
+      gru2 = gru2 or seqGRU:toGRU()
+      remember = remember or 'neither'
+      
+      local input, gradOutput
+      if batchfirst then
+         input = torch.randn(batchsize, seqlen, inputsize)
+         if maskzero then
+            for i=1,seqlen do
+               for j=1,batchsize do
+                  if math.random() < 0.2 then
+                     input[{j,i,{}}]:zero()
+                  end
+               end
+            end
+         end
+         gradOutput = torch.randn(batchsize, seqlen, outputsize)
+         seqGRU2 = seqGRU2 or nn.Sequential()
+            :add(nn.SplitTable(1, 2))
+            :add(nn.Sequencer(gru2))
+            :add(nn.Sequencer(nn.View(batchsize, 1, outputsize)))
+            :add(nn.JoinTable(1,2))
+      else
+         input = torch.randn(seqlen, batchsize, inputsize)
+         if maskzero then
+            for i=1,seqlen do
+               for j=1,batchsize do
+                  if math.random() < 0.2 then
+                     input[{i,j,{}}]:zero()
+                  end
+               end
+            end
+         end
+         gradOutput = torch.randn(seqlen, batchsize, outputsize)
+         seqGRU2 = seqGRU2 or nn.Sequential()
+            :add(nn.SplitTable(1))
+            :add(nn.Sequencer(gru2))
+            :add(nn.Sequencer(nn.View(1, batchsize, outputsize)))
+            :add(nn.JoinTable(1))
+      end
+      
+      seqGRU2:remember(remember)
+      mytester:assert(seqGRU2:get(2)._remember == remember, tostring(seqGRU2:get(2)._remember) ..'~='.. tostring(remember))
+      seqGRU:remember(remember)
+      
+      if eval then
+         seqGRU:evaluate()
+         seqGRU2:evaluate()
+      else
+         seqGRU:training()
+         seqGRU2:training()
+      end
+         
+      -- forward
+      
+      local output = seqGRU:forward(input)
+      
+      local output2 = seqGRU2:forward(input)
+      mytester:assertTensorEq(output, output2, 0.000001)
+      
+      mytester:assertTableEq(output:size():totable(), gradOutput:size():totable(), 0.000001)
+      
+      if not eval then
+         -- backward
+         
+         seqGRU:zeroGradParameters()
+         seqGRU2:zeroGradParameters()
+         local gradInput = seqGRU:backward(input, gradOutput)
+         local gradInput2 = seqGRU2:backward(input, gradOutput)
+         mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+         
+         local gru = seqGRU:toGRU()
+         local params, gradParams = gru:parameters()
+         local params2, gradParams2 = gru2:parameters()
+         
+         for i=1,#params do
+            mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.000001, tostring(gradParams2[i]:size()))
+         end
+      end
+      
+      return gru2, seqGRU2
+   end
+   
+
+   --[[ test batchfirst ]]--
+   
+   local seqlen = 4
+   local batchsize = 5
+   
+   local seqGRU = nn.SeqGRU(inputsize, outputsize)
+   seqGRU.batchfirst = true
+   seqGRU:reset(0.1) -- so that errors are more apparent
+   
+   seqGRU:clearState() -- test clearState
+   seqGRU:forget() -- test forget
+   local gru2 = testmodule(seqGRU, true, seqlen, batchsize)
+   
+   -- test forget
+   
+   local gru2, seqGRU2 = testmodule(seqGRU, true, seqlen, batchsize, gru2)
+   
+   -- test remember
+   
+   testmodule(seqGRU, true, seqlen, batchsize, gru2, 'both', false, seqGRU2)
+   mytester:assert(seqGRU._remember == 'both')
+   
+   -- test variable input size :
+   
+   local seqlen = 5
+   local batchsize = 6
+   
+   testmodule(seqGRU, true, seqlen, batchsize)
+   
+   -- test clearstate :
+   
+   seqGRU:clearState()
+   testmodule(seqGRU, true, seqlen, batchsize)
+   
+   -- test forget (eval)
+   
+   local eval = true
+   local gru2, seqGRU2 = testmodule(seqGRU, true, seqlen, batchsize, gru2, nil, eval)
+   mytester:assert(seqGRU._remember == 'neither')
+   
+   -- test remember (eval)
+   
+   testmodule(seqGRU, true, seqlen, batchsize, gru2, 'both', eval, seqGRU2)
+   mytester:assert(seqGRU._remember == 'both')
+   
+   -- test variable input size (eval) :
+   
+   local seqlen = 4
+   local batchsize = 5
+   
+   testmodule(seqGRU, true, seqlen, batchsize, gru2, nil, eval)
+   
+   seqGRU.maskzero = true
+   gru2:maskZero(1)
+   
+   testmodule(seqGRU, true, seqlen, batchsize, gru2, nil, false, nil, true) 
+   
+   --[[ test batchfirst == false (the default) ]]--
+
+   
+   local seqGRU = nn.SeqGRU(inputsize, outputsize)
+   seqGRU.maskzero = true
+   seqGRU:reset(0.1)
+   
+   local gru2 = testmodule(seqGRU, false, seqlen, batchsize)
+   
+   -- test forget
+   
+   local gru2, seqGRU2 = testmodule(seqGRU, false, seqlen, batchsize, gru2) 
+   
+   -- test remember
+   
+   testmodule(seqGRU, false, seqlen, batchsize, gru2, 'both', false, seqGRU2)
+   mytester:assert(seqGRU._remember == 'both')
+   
+   -- test variable input size :
+   
+   local seqlen = 4
+   local batchsize = 5
+   
+   testmodule(seqGRU, false, seqlen, batchsize)
+   
+   -- test forget (eval)
+   
+   local eval = true
+   
+   local p1 = seqGRU:toGRU():getParameters()
+   local p2 = gru2:getParameters()
+   mytester:assertTensorEq(p1, p2, 0.0000001)
+   testmodule(seqGRU, false, seqlen, batchsize, gru2, nil, eval, seqGRU2) 
+   mytester:assert(seqGRU._remember == 'neither')
+   
+   -- test remember (eval)
+   
+   local p1 = seqGRU:toGRU():getParameters()
+   local p2 = gru2:getParameters()
+   mytester:assertTensorEq(p1, p2, 0.0000001)
+   testmodule(seqGRU, false, seqlen, batchsize, gru2, 'both', eval, seqGRU2)
+   mytester:assert(seqGRU.train == false)
+   mytester:assert(gru2.train == false)
+   mytester:assert(seqGRU._remember == 'both')
+   
+   -- test variable input size (eval) :
+   
+   local seqlen = 4
+   local batchsize = 5
+   
+   testmodule(seqGRU, false, seqlen, batchsize, gru2, nil, eval) 
+   
+   -- test variable length sequences
+   
+   seqGRU.maskzero = true
+   gru2:maskZero(1)
+   
+   testmodule(seqGRU, false, seqlen, batchsize, gru2, nil, false, nil, true) 
+end
+
+function rnntest.SeqGRU_maskzero()
+-- tests that it works with non-masked inputs regardless of maskzero's value..
+  local T, N, D, H = 3, 2, 4, 5
+  local seqGRU = nn.SeqGRU(D,H)
+  seqGRU.maskzero = false
+  local seqGRU2 = seqGRU:clone()
+  seqGRU2.maskzero = true
+  
+
+  local input = torch.randn(T, N, D)
+  local gradOutput = torch.randn(T, N, H)
+
+  local output = seqGRU:forward(input)
+  local output2 = seqGRU2:forward(input)
+
+  mytester:assertTensorEq(output, output2, 0.000001)
+
+  seqGRU:zeroGradParameters()
+  local gradInput = seqGRU:backward(input, gradOutput)
+  seqGRU2:zeroGradParameters()
+  local gradInput2 = seqGRU2:backward(input, gradOutput)
+
+  mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+
+  local params, gradParams = seqGRU:getParameters()
+  local params2, gradParams2 = seqGRU2:getParameters()
+
+  mytester:assertTensorEq(gradParams, gradParams2, 0.000001)
+  if benchmark then
+    local T, N, D, H = 20, 20, 50, 50
+    if pcall(function() require 'cunn' end) then
+      T, N, D, H = 100, 128, 250, 250
+    end
+
+    local seqGRU = nn.SeqGRU(D,H)
+    local input = torch.randn(T, N, D)
+    local gradOutput = torch.randn(T, N, H)
+
+    if cunn then
+      input = input:cuda()
+      gradOutput = gradOutput:cuda()
+      seqGRU:cuda()
+    end
+
+    seqGRU.maskzero = false
+    seqGRU:forward(input)
+    seqGRU:backward(input, gradOutput)
+
+    if cunn then cutorch.synchronize() end
+    local a = torch.Timer()
+    for i=1,5 do
+      seqGRU:forward(input)
+      seqGRU:backward(input, gradOutput)
+    end
+    if cunn then cutorch.synchronize() end
+    local nonmasktime = a:time().real
+
+    for t=1,T do
+      for n=1,N do
+        if math.random() <= 1/20 then
+          input[{t,n,{}}] = 0
+        end
+      end
+    end
+
+    seqGRU.maskzero = true
+    seqGRU:forward(input)
+    seqGRU:backward(input, gradOutput)
+
+    if cunn then cutorch.synchronize() end
+    local a = torch.Timer()
+    for i=1,5 do
+      seqGRU:forward(input)
+      seqGRU:backward(input, gradOutput)
+    end
+    if cunn then cutorch.synchronize() end
+    local masktime = a:time().real
+    print("mask vs nonmask SeqGRU", masktime, nonmasktime)
+  end
+end
+
+function rnntest.FastLSTM_batchNorm()
+   nn.FastLSTM.bn = true
+   
+   local lstm = nn.FastLSTM(3,4)
+   local input, gradOutput = torch.randn(2,3), torch.randn(2,4)
+   local output = lstm:forward(input)
+   lstm:zeroGradParameters()
+   local gradInput = lstm:backward(input, gradOutput)
+   local modules = lstm:findModules('nn.BatchNormalization')
+   mytester:assert(#modules == 3)
+   
+   nn.FastLSTM.bn = false
+end
+
+function rnntest.inplaceBackward()
+   -- not implemented (work was started, but never finished, sorry)
+   if true then return end
+   
+   local lr = 0.1
+   local seqlen, batchsize, hiddensize = 3, 4, 5
+   local input = torch.randn(seqlen, batchsize, hiddensize)
+   local gradOutput = torch.randn(seqlen, batchsize, hiddensize)
+   
+   -- test sequencer(linear)
+   
+   local seq = nn.Sequencer(nn.Linear(hiddensize, hiddensize))
+   local seq2 = seq:clone()
+   seq2:inplaceBackward()
+   
+   local output = seq:forward(input)
+   local output2 = seq2:forward(input)
+   
+   mytester:assertTensorEq(output, output2, 0.000001)
+   
+   seq:zeroGradParameters()
+   local gradInput = seq:backward(input, gradOutput)
+   seq:updateParameters(lr)
+   
+   local gradInput2 = seq2:backward(input, gradOutput, -lr)
+   
+   mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+   
+   local params = seq:parameters()
+   local params2 = seq2:parameters()
+   
+   for i=1,#params do
+      mytester:assertTensorEq(params[i], params2[i], 0.000001)
+   end
+   
+   -- test seqlstm
+   
+   local seq = nn.SeqLSTM(hiddensize, hiddensize)
+   local seq2 = seq:clone()
+   seq2:inplaceBackward()
+   
+   local output = seq:forward(input)
+   local output2 = seq2:forward(input)
+   
+   mytester:assertTensorEq(output, output2, 0.000001)
+   
+   seq:zeroGradParameters()
+   local gradInput = seq:backward(input, gradOutput)
+   seq:updateParameters(lr)
+   
+   local gradInput2 = seq2:backward(input, gradOutput, -lr)
+   
+   mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+   
+   local params = seq:parameters()
+   local params2 = seq2:parameters()
+   
+   for i=1,#params do
+      mytester:assertTensorEq(params[i], params2[i], 0.000001)
+   end
+   
+   
+   if true then return end
+   -- test language model
+   
+   local vocabsize = 100
+   local input = torch.LongTensor(seqlen, batchsize):random(1,vocabsize)
+   local target = torch.LongTensor(seqlen, batchsize):random(1,vocabsize)
+   
+   local lm = nn.Sequential()
+   local lookup = nn.LookupTableMaskZero(vocabsize, hiddensize)
+   lm:add(lookup)
+
+   for i=1,2 do
+      local rnn = nn.SeqLSTM(hiddensize, hiddensize)
+      rnn.maskzero = true
+      lm:add(rnn)
+   end
+
+   lm:add(nn.SplitTable(1))
+
+   local unigram = torch.FloatTensor(vocabsize):uniform(1,10)
+   local ncemodule = nn.NCEModule(hiddensize, vocabsize, 10, unigram, -1)
+   local _sampleidx = torch.Tensor(1,10):random(1,vocabsize)
+   
+   function ncemodule.noiseSample(self, sampleidx, batchsize, k)
+      assert(batchsize == 1)
+      assert(k == 10)
+      sampleidx:resize(1, k):copy(_sampleidx)
+      return sampleidx
+   end
+
+   lm = nn.Sequential()
+      :add(nn.ParallelTable()
+         :add(lm):add(nn.Identity()))
+      :add(nn.ZipTable()) 
+
+   lm:add(nn.Sequencer(nn.MaskZero(ncemodule, 1)))
+   lm:remember()
+   
+   local crit = nn.MaskZeroCriterion(nn.NCECriterion(), 0)
+   local targetmodule = nn.SplitTable(1)
+   local criterion = nn.SequencerCriterion(crit)
+   
+   local lm2 = lm:clone()
+   lm2:inplaceBackward()
+   
+   local criterion2 = criterion:clone()
+   
+   local target = targetmodule:forward(target)
+   
+   local inputTable = {input, target}
+   
+   local output = lm:forward(inputTable)
+   local output2 = lm2:forward(inputTable)
+   
+   for i=1,seqlen do
+      mytester:assertTensorEq(output[i][1], output2[i][1], 0.000001)
+      mytester:assertTensorEq(output[i][2], output2[i][2], 0.000001)
+      mytester:assertTensorEq(output[i][3], output2[i][3], 0.000001)
+      mytester:assertTensorEq(output[i][4], output2[i][4], 0.000001)
+   end
+   
+   local loss = criterion:forward(output, target)
+   local loss2 = criterion2:forward(output, target)
+   
+   local gradOutput = criterion:backward(output, target)
+   local gradOutput2 = criterion2:backward(output, target)
+   
+   for i=1,seqlen do
+      mytester:assertTensorEq(gradOutput[i][1], gradOutput2[i][1], 0.000001)
+      mytester:assertTensorEq(gradOutput[i][2], gradOutput2[i][2], 0.000001)
+   end
+   
+   lm:zeroGradParameters()
+   lm:backward(inputTable, gradOutput)
+   lm:updateParameters(lr)
+   
+   lm2:backward(inputTable, gradOutput2, -lr)
+   
+   local params = lm:parameters()
+   local params2 = lm2:parameters()
+   
+   for i=1,#params do
+      mytester:assertTensorEq(params[i], params2[i], 0.000001, "error in params "..i..": "..tostring(params[i]:size()))
+   end
 end
 
 function rnn.test(tests, benchmark_)

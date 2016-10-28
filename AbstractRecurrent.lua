@@ -23,6 +23,7 @@ function AbstractRecurrent:__init(rho)
 end
 
 function AbstractRecurrent:getStepModule(step)
+   local _ = require 'moses'
    assert(step, "expecting step at arg 1")
    local recurrentModule = self.sharedClones[step]
    if not recurrentModule then
@@ -79,6 +80,7 @@ function AbstractRecurrent:recycle(offset)
    -- offset can be used to skip initialModule (if any)
    offset = offset or 0
    
+   local _ = require 'moses'
    self.nSharedClone = self.nSharedClone or _.size(self.sharedClones) 
 
    local rho = math.max(self.rho + 1, self.nSharedClone)
@@ -96,8 +98,13 @@ function AbstractRecurrent:recycle(offset)
 end
 
 function nn.AbstractRecurrent:clearState()
-   nn.utils.clear(self, '_input', '_gradOutput', '_gradOutputs', 'sharedClones', 'gradPrevOutput', 'cell', 'cells', 'gradCells')
-   self.nSharedClone = 0
+   self:forget()
+   -- keep the first two sharedClones
+   nn.utils.clear(self, '_input', '_gradOutput', '_gradOutputs', 'gradPrevOutput', 'cell', 'cells', 'gradCells', 'outputs', 'gradInputs')
+   for i, clone in ipairs(self.sharedClones) do
+      clone:clearState()
+   end
+   self.recurrentModule:clearState()
    return parent.clearState(self)
 end
 
@@ -105,6 +112,7 @@ end
 function AbstractRecurrent:forget()
    -- the recurrentModule may contain an AbstractRecurrent instance (issue 107)
    parent.forget(self) 
+   local _ = require 'moses'
    
     -- bring all states back to the start of the sequence buffers
    if self.train ~= false then

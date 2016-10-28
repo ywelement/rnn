@@ -40,20 +40,22 @@ see a bit higher memory usage in practice.
 --]]
 local SeqLSTM, parent = torch.class('nn.SeqLSTM', 'nn.Module')
 
-function SeqLSTM:__init(inputsize, outputsize)
+function SeqLSTM:__init(inputsize, hiddensize, outputsize)
    parent.__init(self)
-
-   local D, H = inputsize, outputsize
-   self.inputsize, self.outputsize = D, H
-
-   self.weight = torch.Tensor(D + H, 4 * H)
-   self.gradWeight = torch.Tensor(D + H, 4 * H):zero()
+   -- for non-SeqLSTMP, only inputsize, hiddensize=outputsize are provided
+   outputsize = outputsize or hiddensize
+   local D, H, R = inputsize, hiddensize, outputsize
+   self.inputsize, self.hiddensize, self.outputsize = D, H, R
+   
+   self.weight = torch.Tensor(D+R, 4 * H)
+   self.gradWeight = torch.Tensor(D+R, 4 * H)
+   
    self.bias = torch.Tensor(4 * H)
    self.gradBias = torch.Tensor(4 * H):zero()
    self:reset()
 
-   self.cell = torch.Tensor()      -- This will be  (T, N, H)
-   self.gates = torch.Tensor()    -- This will be (T, N, 4H)
+   self.cell = torch.Tensor()    -- This will be  (T, N, H)
+   self.gates = torch.Tensor()   -- This will be (T, N, 4H)
    self.buffer1 = torch.Tensor() -- This will be (N, H)
    self.buffer2 = torch.Tensor() -- This will be (N, H)
    self.buffer3 = torch.Tensor() -- This will be (1, 4H)
@@ -92,9 +94,24 @@ function SeqLSTM:resetStates()
    self.c0 = self.c0.new()
 end
 
-SeqLSTM.nInputDim = 1
-SeqLSTM.recursiveMask = nn.TrimZero.recursiveMask
-SeqLSTM.recursiveUnMask = nn.TrimZero.recursiveUnMask
+-- unlike MaskZero, the mask is applied in-place
+function SeqLSTM:recursiveMask(output, mask)
+   if torch.type(output) == 'table' then
+      for k,v in ipairs(output) do
+         self:recursiveMask(output[k], mask)
+      end
+   else
+      assert(torch.isTensor(output))
+      
+      -- make sure mask has the same dimension as the output tensor
+      local outputSize = output:size():fill(1)
+      outputSize[1] = output:size(1)
+      mask:resize(outputSize)
+      -- build mask
+      local zeroMask = mask:expandAs(output)
+      output:maskedFill(zeroMask, 0)
+   end
+end
 
 local function check_dims(x, dims)
    assert(x:dim() == #dims)
@@ -153,7 +170,8 @@ function SeqLSTM:updateOutput(input)
    self.recompute_backward = true
    local c0, h0, x = self:_prepare_size(input)
    local N, T = x:size(2), x:size(1)
-   local D, H = self.inputsize, self.outputsize
+   self.hiddensize = self.hiddensize or self.outputsize -- backwards compat
+   local H, R, D = self.hiddensize, self.outputsize, self.inputsize
    
    self._output = self._output or self.weight.new()
    
@@ -196,7 +214,7 @@ function SeqLSTM:updateOutput(input)
          assert(prev_N == N, 'batch sizes must be consistent with userPrevOutput')
          h0:resizeAs(self.userPrevOutput):copy(self.userPrevOutput)
       elseif h0:nElement() == 0 or not remember then
-         h0:resize(N, H):zero()
+         h0:resize(N, R):zero()
       elseif remember then
          local prev_T, prev_N = self._output:size(1), self._output:size(2)
          assert(prev_N == N, 'batch sizes must be the same to remember states')
@@ -205,47 +223,19 @@ function SeqLSTM:updateOutput(input)
    end
 
    local bias_expand = self.bias:view(1, 4 * H):expand(N, 4 * H)
-   local Wx = self.weight[{{1, D}}]
-   local Wh = self.weight[{{D + 1, D + H}}]
+   local Wx = self.weight:narrow(1,1,D)
+   local Wh = self.weight:narrow(1,D+1,R)
 
    local h, c = self._output, self.cell
-   h:resize(T, N, H):zero()
+   h:resize(T, N, R):zero()
    c:resize(T, N, H):zero()
    local prev_h, prev_c = h0, c0
    self.gates:resize(T, N, 4 * H):zero()
    for t = 1, T do
       local cur_x = x[t]
-      local next_h = h[t]
+      self.next_h = h[t]
       local next_c = c[t]
       local cur_gates = self.gates[t]
-      
-      if self.maskzero then
-         -- TODO : 
-         -- do not do anything for time-step batches that have no masks.
-         
-         -- build mask
-         local vectorDim = cur_x:dim() 
-         self._zeroMask = self._zeroMask or cur_x.new()
-         self._zeroMask:norm(cur_x, 2, vectorDim)
-         self.zeroMask = self.zeroMask or ((torch.type(cur_x) == 'torch.CudaTensor') and torch.CudaTensor() or torch.ByteTensor())
-         self._zeroMask.eq(self.zeroMask, self._zeroMask, 0)         
-         -- uses torch.index to consolidate the non-zeromask rows
-         self.maskedinput = self:recursiveMask(self.maskedinput, {cur_x, prev_h, prev_c}, self.zeroMask)
-         
-         -- uses buffers for the intermediate and output states
-         cur_x, prev_h, prev_c = unpack(self.maskedinput)
-         self._next_h = self._next_h or next_h.new()
-         self._next_h:resizeAs(prev_h):zero()
-         self._next_c = self._next_c or next_c.new()
-         self._next_c:resizeAs(prev_c):zero()
-         self._cur_gates = self._cur_gates or cur_gates.new()
-         local n = cur_x:size(1) -- number of non-zero rows
-         self._cur_gates:resize(n, 4*H):zero()
-         
-         next_h, next_c, cur_gates = self._next_h, self._next_c, self._cur_gates
-         bias_expand = self.bias:view(1, 4 * H):expand(n, 4 * H)
-      end
-      
       cur_gates:addmm(bias_expand, cur_x, Wx)
       cur_gates:addmm(prev_h, Wh)
       cur_gates[{{}, {1, 3 * H}}]:sigmoid()
@@ -254,15 +244,25 @@ function SeqLSTM:updateOutput(input)
       local f = cur_gates[{{}, {H + 1, 2 * H}}] -- forget gate
       local o = cur_gates[{{}, {2 * H + 1, 3 * H}}] -- output gate
       local g = cur_gates[{{}, {3 * H + 1, 4 * H}}] -- input transform
-      next_h:cmul(i, g)
-      next_c:cmul(f, prev_c):add(next_h)
-      next_h:tanh(next_c):cmul(o)
+      self.next_h:cmul(i, g)
+      next_c:cmul(f, prev_c):add(self.next_h)
+      self.next_h:tanh(next_c):cmul(o)
+      
+      -- for LSTMP
+      self:adapter(t)
       
       if self.maskzero then
-         next_h, next_c = unpack(self:recursiveUnMask({h[t], c[t], self.gates[t]}, {next_h, next_c, cur_gates}, self.zeroMask, true))
+         -- build mask from input
+         local vectorDim = cur_x:dim() 
+         self._zeroMask = self._zeroMask or cur_x.new()
+         self._zeroMask:norm(cur_x, 2, vectorDim)
+         self.zeroMask = self.zeroMask or ((torch.type(cur_x) == 'torch.CudaTensor') and torch.CudaByteTensor() or torch.ByteTensor())
+         self._zeroMask.eq(self.zeroMask, self._zeroMask, 0)     
+         -- zero masked output
+         self:recursiveMask({self.next_h, next_c, cur_gates}, self.zeroMask)
       end
       
-      prev_h, prev_c = next_h, next_c
+      prev_h, prev_c = self.next_h, next_c
    end
    self.userPrevOutput = nil
    self.userPrevCell = nil
@@ -276,6 +276,10 @@ function SeqLSTM:updateOutput(input)
    return self.output
 end
 
+function SeqLSTM:adapter(scale, t)
+   -- Placeholder for SeqLSTMP
+end
+
 function SeqLSTM:backward(input, gradOutput, scale)
    self.recompute_backward = false
    scale = scale or 1.0
@@ -284,9 +288,10 @@ function SeqLSTM:backward(input, gradOutput, scale)
    local c0, h0, x, grad_h = self:_prepare_size(input, gradOutput)
    assert(grad_h, "Expecting gradOutput")
    local N, T = x:size(2), x:size(1)
-   local D, H = self.inputsize, self.outputsize
+   self.hiddensize = self.hiddensize or self.outputsize -- backwards compat
+   local H, R, D = self.hiddensize, self.outputsize, self.inputsize
    
-   self._grad_x = self._grad_x or self.weight.new()
+   self._grad_x = self._grad_x or self.weight:narrow(1,1,D).new()
    
    if not c0 then c0 = self.c0 end
    if not h0 then h0 = self.h0 end
@@ -294,10 +299,10 @@ function SeqLSTM:backward(input, gradOutput, scale)
    local grad_c0, grad_h0, grad_x = self.grad_c0, self.grad_h0, self._grad_x
    local h, c = self._output, self.cell
    
-   local Wx = self.weight[{{1, D}}]
-   local Wh = self.weight[{{D + 1, D + H}}]
-   local grad_Wx = self.gradWeight[{{1, D}}]
-   local grad_Wh = self.gradWeight[{{D + 1, D + H}}]
+   local Wx = self.weight:narrow(1,1,D)
+   local Wh = self.weight:narrow(1,D+1,R)
+   local grad_Wx = self.gradWeight:narrow(1,1,D)
+   local grad_Wh = self.gradWeight:narrow(1,D+1,R)
    local grad_b = self.gradBias
 
    grad_h0:resizeAs(h0):zero()
@@ -305,7 +310,7 @@ function SeqLSTM:backward(input, gradOutput, scale)
    grad_x:resizeAs(x):zero()
    self.buffer1:resizeAs(h0)
    self.buffer2:resizeAs(c0)
-   local grad_next_h = self.gradPrevOutput and self.buffer1:copy(self.gradPrevOutput) or self.buffer1:zero()
+   self.grad_next_h = self.gradPrevOutput and self.buffer1:copy(self.gradPrevOutput) or self.buffer1:zero()
    local grad_next_c = self.userNextGradCell and self.buffer2:copy(self.userNextGradCell) or self.buffer2:zero()
    
    for t = T, 1, -1 do
@@ -316,7 +321,23 @@ function SeqLSTM:backward(input, gradOutput, scale)
       else
          prev_h, prev_c = h[t - 1], c[t - 1]
       end
-      grad_next_h:add(grad_h[t])
+      self.grad_next_h:add(grad_h[t])
+      
+      if self.maskzero and torch.type(self) ~= 'nn.SeqLSTM' then 
+         -- we only do this for sub-classes (LSTM doesn't need it)   
+         -- build mask from input
+         local cur_x = x[t]
+         local vectorDim = cur_x:dim()
+         self._zeroMask = self._zeroMask or cur_x.new()
+         self._zeroMask:norm(cur_x, 2, vectorDim)
+         self.zeroMask = self.zeroMask or ((torch.type(cur_x) == 'torch.CudaTensor') and torch.CudaByteTensor() or torch.ByteTensor())
+         self._zeroMask.eq(self.zeroMask, self._zeroMask, 0)
+         -- zero masked gradOutput
+         self:recursiveMask(self.grad_next_h, self.zeroMask)
+      end
+      
+      -- for LSTMP
+      self:gradAdapter(scale, t)
 
       local i = self.gates[{t, {}, {1, H}}]
       local f = self.gates[{t, {}, {H + 1, 2 * H}}]
@@ -336,12 +357,12 @@ function SeqLSTM:backward(input, gradOutput, scale)
       local tanh_next_c = grad_ai:tanh(next_c)
       local tanh_next_c2 = grad_af:cmul(tanh_next_c, tanh_next_c)
       local my_grad_next_c = grad_ao
-      my_grad_next_c:fill(1):add(-1, tanh_next_c2):cmul(o):cmul(grad_next_h)
+      my_grad_next_c:fill(1):add(-1, tanh_next_c2):cmul(o):cmul(self.grad_next_h)
       grad_next_c:add(my_grad_next_c)
       
       -- We need tanh_next_c (currently in grad_ai) to compute grad_ao; after
       -- that we can overwrite it.
-      grad_ao:fill(1):add(-1, o):cmul(o):cmul(tanh_next_c):cmul(grad_next_h)
+      grad_ao:fill(1):add(-1, o):cmul(o):cmul(tanh_next_c):cmul(self.grad_next_h)
 
       -- Use grad_ai as a temporary buffer for computing grad_ag
       local g2 = grad_ai:cmul(g, g)
@@ -356,11 +377,12 @@ function SeqLSTM:backward(input, gradOutput, scale)
       grad_Wh:addmm(scale, prev_h:t(), grad_a)
       local grad_a_sum = self.buffer3:resize(1, 4 * H):sum(grad_a, 1)
       grad_b:add(scale, grad_a_sum)
-
-      grad_next_h:mm(grad_a, Wh:t())
+      
+      self.grad_next_h = torch.mm(grad_a, Wh:t())
       grad_next_c:cmul(f)
+      
    end
-   grad_h0:copy(grad_next_h)
+   grad_h0:copy(self.grad_next_h)
    grad_c0:copy(grad_next_c)
    
    if self.batchfirst then
@@ -382,6 +404,10 @@ function SeqLSTM:backward(input, gradOutput, scale)
    end
 
    return self.gradInput
+end
+
+function SeqLSTM:gradAdapter(scale, t)
+   -- Placeholder for SeqLSTMP
 end
 
 function SeqLSTM:clearState()

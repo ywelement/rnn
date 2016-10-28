@@ -1,4 +1,5 @@
 require 'dpnn'
+require 'torchx'
 dpnn.version = dpnn.version or 0
 assert(dpnn.version > 1, "Please update dpnn : luarocks install dpnn")
 
@@ -17,7 +18,8 @@ torch.include('rnn', 'Module.lua')
 torch.include('rnn', 'Dropout.lua')
 
 -- for testing:
-torch.include('rnn', 'test.lua')
+torch.include('rnn', 'test/test.lua')
+torch.include('rnn', 'test/bigtest.lua')
 
 -- support modules
 torch.include('rnn', 'ZeroGrad.lua')
@@ -48,6 +50,8 @@ torch.include('rnn', 'RecurrentAttention.lua')
 
 -- sequencer + recurrent modules
 torch.include('rnn', 'SeqLSTM.lua')
+torch.include('rnn', 'SeqLSTMP.lua')
+torch.include('rnn', 'SeqGRU.lua')
 torch.include('rnn', 'SeqReverseSequence.lua')
 torch.include('rnn', 'SeqBRNN.lua')
 
